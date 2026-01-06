@@ -1,11 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Net;
+using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Runtime;
 
 namespace DotnetDumper
@@ -127,28 +130,155 @@ namespace DotnetDumper
             }
 
             bool dumpAllNonMicrosoft = false;
-            string dumpPath;
+            bool outputJson = false;
+            string? encodeKey = null;
+            string dumpPath = string.Empty;
             string? outputFolder = null;
+            int? targetPid = null;
 
             // Args:
-            //  DotnetDumper <dumpPath>
-            //  DotnetDumper <dumpPath> <outputFolder>
-            //  DotnetDumper <dumpPath> --dump-all
-            //  DotnetDumper <dumpPath> <outputFolder> --dump-all
-            dumpPath = args[0];
+            //  DotnetDumper <dumpPath> [outputFolder] [--dump-all] [--json] [--encode [key]]
+            //  DotnetDumper --pid <pid> [outputFolder] [--dump-all] [--json] [--encode [key]]
 
-            if (args.Length >= 2)
+            bool pidMode = IsPidFlag(args[0]);
+            int startIndex;
+            if (pidMode)
             {
-                if (IsDumpAllFlag(args[1]))
-                    dumpAllNonMicrosoft = true;
-                else
-                    outputFolder = args[1];
+                if (args.Length < 2)
+                {
+                    PrintUsage();
+                    return 1;
+                }
+
+                if (!int.TryParse(args[1], out int parsedPid) || parsedPid <= 0)
+                {
+                    Console.Error.WriteLine($"[!] Invalid PID: {args[1]}");
+                    return 1;
+                }
+
+                targetPid = parsedPid;
+                startIndex = 2;
+            }
+            else
+            {
+                dumpPath = args[0];
+                startIndex = 1;
             }
 
-            if (args.Length >= 3)
+            for (int i = startIndex; i < args.Length; i++)
             {
-                if (IsDumpAllFlag(args[2]))
+                if (IsDumpAllFlag(args[i]))
                     dumpAllNonMicrosoft = true;
+                else if (IsJsonFlag(args[i]))
+                    outputJson = true;
+                else if (IsEncodeFlag(args[i]))
+                {
+                    // Default to "infected" if no key provided or next arg is another flag
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-"))
+                        encodeKey = args[++i];
+                    else
+                        encodeKey = "infected";
+                }
+                else if (outputFolder == null)
+                    outputFolder = args[i];
+            }
+
+            if (targetPid != null)
+            {
+                string pidLabel = $"pid{targetPid.Value}";
+                try
+                {
+                    using Process p = Process.GetProcessById(targetPid.Value);
+                    pidLabel = SanitizeFileName($"{p.ProcessName}_{targetPid.Value}");
+                }
+                catch
+                {
+                    // best effort only
+                }
+
+                // This tool is for .NET triage only. If the target is not a CLR/.NET process, exit early.
+                if (!OperatingSystem.IsWindows())
+                {
+                    Console.Error.WriteLine("[!] --pid mode is only supported on Windows.");
+                    return 2;
+                }
+
+                bool isClr = IsLikelyClrProcess(targetPid.Value, out string? clrDetectError);
+                if (!isClr && clrDetectError == null)
+                {
+                    Console.WriteLine($"[i] PID {targetPid.Value} does not appear to be a CLR/.NET process. Exiting.");
+                    return 0;
+                }
+
+                // Preflight: if we can infer the CLR architecture from module paths, avoid taking a dump
+                // that this build cannot analyze (common for Desktop CLR on ARM64/ARM64EC).
+                if (TryGetClrModuleArchHintFromLiveProcess(targetPid.Value, out var liveClrArchHint, out var liveClrModulePath, out var liveClrHintError))
+                {
+                    if (liveClrArchHint == System.Runtime.InteropServices.Architecture.Arm64 &&
+                        RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.X64)
+                    {
+                        Console.Error.WriteLine("[!] Target CLR appears to be ARM64 (FrameworkArm64). The x64 build cannot load an ARM64 DAC.");
+                        if (!string.IsNullOrWhiteSpace(liveClrModulePath))
+                            Console.Error.WriteLine($"[!] CLR module: {liveClrModulePath}");
+                        Console.Error.WriteLine("[!] Run DotnetDumper_arm64.exe instead.");
+                        return 2;
+                    }
+
+                    if (liveClrArchHint == System.Runtime.InteropServices.Architecture.X64 &&
+                        RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64)
+                    {
+                        Console.Error.WriteLine("[!] Target CLR appears to be x64 (Framework64). The ARM64 build cannot load an AMD64 DAC.");
+                        if (!string.IsNullOrWhiteSpace(liveClrModulePath))
+                            Console.Error.WriteLine($"[!] CLR module: {liveClrModulePath}");
+                        Console.Error.WriteLine("[!] Run DotnetDumper_x64.exe instead (on ARM64 Windows, run under x64 emulation). ");
+                        return 2;
+                    }
+                }
+                else if (liveClrHintError != null)
+                {
+                    // Best-effort only; don't block dumping if we can't inspect modules.
+                    Console.WriteLine($"[i] Preflight CLR-arch hint unavailable: {liveClrHintError}");
+                }
+
+                if (string.IsNullOrWhiteSpace(outputFolder))
+                    outputFolder = Path.Combine(Environment.CurrentDirectory, $"{pidLabel}_analysis");
+
+                Directory.CreateDirectory(outputFolder);
+
+                dumpPath = Path.Combine(outputFolder, $"{pidLabel}_{DateTime.UtcNow:yyyyMMdd_HHmmss}.dmp");
+
+                // If we couldn't enumerate modules (often access denied), fall back to a short dump+check.
+                // If it's not CLR, we delete the dump and exit.
+                if (!isClr && clrDetectError != null)
+                {
+                    Console.WriteLine($"[i] Unable to determine CLR status for PID {targetPid.Value} ({clrDetectError}).");
+                    Console.WriteLine("[i] Capturing a small process-style dump to determine if CLR is present...");
+                }
+                else
+                {
+                    Console.WriteLine($"[+] CLR/.NET process detected for PID {targetPid.Value}. Capturing process dump...");
+                }
+
+                Console.WriteLine($"[+] Dump path: {dumpPath}");
+
+                if (!TryWriteProcessDump(targetPid.Value, dumpPath, out string? dumpError))
+                {
+                    Console.Error.WriteLine($"[!] Failed to write process dump: {dumpError}");
+                    return 2;
+                }
+
+                if (!isClr && clrDetectError != null)
+                {
+                    if (!DumpContainsClr(dumpPath, out string? dumpClrError))
+                    {
+                        TryDeleteFile(dumpPath);
+                        Console.WriteLine($"[i] Dump does not contain a CLR/.NET runtime. Exiting."
+                            + (dumpClrError != null ? $" ({dumpClrError})" : ""));
+                        return 0;
+                    }
+
+                    Console.WriteLine("[+] CLR/.NET runtime detected in dump. Continuing triage.");
+                }
             }
 
             if (!File.Exists(dumpPath))
@@ -168,7 +298,7 @@ namespace DotnetDumper
 
             try
             {
-                RunTriage(dumpPath, outputFolder, dumpAllNonMicrosoft);
+                RunTriage(dumpPath, outputFolder, dumpAllNonMicrosoft, outputJson, encodeKey);
                 return 0;
             }
             catch (Exception ex)
@@ -183,35 +313,251 @@ namespace DotnetDumper
             s.Equals("--dump-all", StringComparison.OrdinalIgnoreCase) ||
             s.Equals("-dump-all", StringComparison.OrdinalIgnoreCase);
 
+        private static bool IsJsonFlag(string s) =>
+            s.Equals("--json", StringComparison.OrdinalIgnoreCase) ||
+            s.Equals("-json", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsEncodeFlag(string s) =>
+            s.Equals("--encode", StringComparison.OrdinalIgnoreCase) ||
+            s.Equals("-encode", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsPidFlag(string s) =>
+            s.Equals("--pid", StringComparison.OrdinalIgnoreCase) ||
+            s.Equals("-pid", StringComparison.OrdinalIgnoreCase);
+
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
-            Console.WriteLine("  DotnetDumper <dumpPath> [outputFolder] [--dump-all]");
+            Console.WriteLine("  DotnetDumper <dumpPath> [outputFolder] [--dump-all] [--json] [--encode [key]]");
+            Console.WriteLine("  DotnetDumper --pid <pid> [outputFolder] [--dump-all] [--json] [--encode [key]]");
+            Console.WriteLine();
+            Console.WriteLine("Options:");
+            Console.WriteLine("  --dump-all      Dump all non-Microsoft assemblies (not just dynamic)");
+            Console.WriteLine("  --json          Output modules.json and patch_detection.json");
+            Console.WriteLine("  --encode [key]  RC4 encode dumped assemblies (evades AV), saves as .bin");
+            Console.WriteLine("                  Default key: 'infected'");
+            Console.WriteLine("  --pid <pid>     Capture a Windows process dump first, then triage it");
+            Console.WriteLine("                  NOTE: dump capture uses a 'process-style' minidump (not full-memory).");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp");
             Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp C:\\analysis\\w3wp");
-            Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp --dump-all");
+            Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp --dump-all --json");
+            Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp --encode");
+            Console.WriteLine("  DotnetDumper --pid 4242 C:\\analysis\\w3wp --dump-all --json");
         }
 
-        private static void RunTriage(string dumpPath, string outputFolder, bool dumpAllNonMicrosoft)
+        [Flags]
+        private enum MINIDUMP_TYPE : uint
+        {
+            MiniDumpNormal = 0x00000000,
+            MiniDumpWithDataSegs = 0x00000001,
+            MiniDumpWithFullMemory = 0x00000002,
+            MiniDumpWithHandleData = 0x00000004,
+            MiniDumpScanMemory = 0x00000010,
+            MiniDumpWithUnloadedModules = 0x00000020,
+            MiniDumpWithIndirectlyReferencedMemory = 0x00000040,
+            MiniDumpWithPrivateReadWriteMemory = 0x00000200,
+            MiniDumpWithFullMemoryInfo = 0x00000800,
+            MiniDumpWithThreadInfo = 0x00001000,
+            MiniDumpWithTokenInformation = 0x00004000,
+        }
+
+        [DllImport("dbghelp.dll", SetLastError = true)]
+        private static extern bool MiniDumpWriteDump(
+            IntPtr hProcess,
+            int processId,
+            Microsoft.Win32.SafeHandles.SafeFileHandle hFile,
+            MINIDUMP_TYPE dumpType,
+            IntPtr exceptionParam,
+            IntPtr userStreamParam,
+            IntPtr callbackParam);
+
+        private static bool TryWriteProcessDump(int pid, string dumpPath, out string? error)
+        {
+            if (!OperatingSystem.IsWindows())
+            {
+                error = "--pid mode is only supported on Windows.";
+                return false;
+            }
+
+            try
+            {
+                using Process process = Process.GetProcessById(pid);
+
+                // Process-style dump (not full-memory). This is a compromise between fidelity and size.
+                MINIDUMP_TYPE flags =
+                    MINIDUMP_TYPE.MiniDumpNormal |
+                    MINIDUMP_TYPE.MiniDumpWithUnloadedModules |
+                    MINIDUMP_TYPE.MiniDumpWithHandleData |
+                    MINIDUMP_TYPE.MiniDumpWithThreadInfo |
+                    MINIDUMP_TYPE.MiniDumpWithFullMemoryInfo |
+                    MINIDUMP_TYPE.MiniDumpWithPrivateReadWriteMemory |
+                    MINIDUMP_TYPE.MiniDumpWithDataSegs |
+                    MINIDUMP_TYPE.MiniDumpScanMemory |
+                    MINIDUMP_TYPE.MiniDumpWithTokenInformation;
+
+                using var fs = new FileStream(dumpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                bool ok = MiniDumpWriteDump(
+                    process.Handle,
+                    process.Id,
+                    fs.SafeFileHandle,
+                    flags,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero);
+
+                if (!ok)
+                {
+                    int lastError = Marshal.GetLastWin32Error();
+                    error = $"MiniDumpWriteDump failed. Win32Error={lastError}";
+                    return false;
+                }
+
+                error = null;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        // ------------------------------ TRIAGE MODE ------------------------------
+
+        private static void RunTriage(string dumpPath, string outputFolder, bool dumpAllNonMicrosoft, bool outputJson, string? encodeKey)
         {
             Console.WriteLine($"[+] Loading dump: {dumpPath}");
 
             using DataTarget dataTarget = DataTarget.LoadDump(dumpPath);
 
+            Directory.CreateDirectory(outputFolder);
+
             var clr = dataTarget.ClrVersions.FirstOrDefault();
             if (clr == null)
             {
-                Console.WriteLine("[!] This dump does not contain a .NET CLR.");
+                Console.WriteLine("[i] This dump does not contain a .NET CLR. Exiting.");
                 return;
             }
 
-            using ClrRuntime runtime = clr.CreateRuntime();
-            ClrHeap heap = runtime.Heap;
+            // Detect architecture mismatch early.
+            // Note: bitness alone is not enough (ARM64 vs AMD64 are both 64-bit).
+            Architecture dumpArch = dataTarget.DataReader.Architecture;
+            System.Runtime.InteropServices.Architecture processArch = RuntimeInformation.ProcessArchitecture;
+
+            // ClrMD's architecture can be ambiguous for ARM64EC dumps. Use the CLR module path as a strong hint.
+            string? clrModulePath = clr.ModuleInfo.FileName;
+            System.Runtime.InteropServices.Architecture? clrModuleArchHint = null;
+            if (!string.IsNullOrWhiteSpace(clrModulePath))
+            {
+                if (clrModulePath.Contains(@"\Microsoft.NET\FrameworkArm64\", StringComparison.OrdinalIgnoreCase))
+                    clrModuleArchHint = System.Runtime.InteropServices.Architecture.Arm64;
+                else if (clrModulePath.Contains(@"\Microsoft.NET\Framework64\", StringComparison.OrdinalIgnoreCase))
+                    clrModuleArchHint = System.Runtime.InteropServices.Architecture.X64;
+                else if (clrModulePath.Contains(@"\Microsoft.NET\Framework\", StringComparison.OrdinalIgnoreCase))
+                    clrModuleArchHint = System.Runtime.InteropServices.Architecture.X86;
+            }
+
+            Console.WriteLine($"[+] Host process architecture: {processArch}");
+            Console.WriteLine($"[+] Dump architecture: {dumpArch}");
+            if (!string.IsNullOrWhiteSpace(clrModulePath))
+                Console.WriteLine($"[+] CLR module path: {clrModulePath}");
+            if (clrModuleArchHint != null)
+                Console.WriteLine($"[+] CLR module architecture hint: {clrModuleArchHint}");
+
+            // ARM64EC commonly shows up as X64 in the data reader, but the CLR module path can be FrameworkArm64.
+            // In that situation, ClrMD will generally behave like an X64 target (and require the x64 analysis binary).
+            bool isArm64EcSuspected = dumpArch == Architecture.X64 && clrModuleArchHint == System.Runtime.InteropServices.Architecture.Arm64;
+            if (isArm64EcSuspected)
+            {
+                Console.WriteLine("[!] ARM64EC-style dump detected (x64 context with FrameworkArm64 CLR module).");
+                if (processArch == System.Runtime.InteropServices.Architecture.X64)
+                    Console.WriteLine("[!] You are running the x64 build: this can analyze the x64 context, but cannot load an ARM64 DAC.");
+                else if (processArch == System.Runtime.InteropServices.Architecture.Arm64)
+                    Console.WriteLine("[!] You are running the ARM64 build: this can load ARM64 DACs, but the dump may still require an AMD64 DAC depending on how it was captured.");
+            }
+
+            System.Runtime.InteropServices.Architecture? mappedDumpArch = dumpArch switch
+            {
+                Architecture.X64 => System.Runtime.InteropServices.Architecture.X64,
+                Architecture.X86 => System.Runtime.InteropServices.Architecture.X86,
+                Architecture.Arm64 => System.Runtime.InteropServices.Architecture.Arm64,
+                _ => null
+            };
+
+            System.Runtime.InteropServices.Architecture effectiveDumpArch;
+            if (isArm64EcSuspected)
+            {
+                effectiveDumpArch = System.Runtime.InteropServices.Architecture.X64;
+            }
+            else if (mappedDumpArch != null)
+            {
+                effectiveDumpArch = mappedDumpArch.Value;
+            }
+            else if (clrModuleArchHint != null)
+            {
+                effectiveDumpArch = clrModuleArchHint.Value;
+            }
+            else
+            {
+                effectiveDumpArch = processArch;
+            }
+
+            bool archCompatible;
+            if (isArm64EcSuspected)
+            {
+                // ARM64EC: ClrMD may report X64 while CLR module is Arm64. Allow either tool build.
+                // In practice, the ARM64 build can load ARM64 DACs, and the x64 build can handle the x64 context.
+                archCompatible = processArch == System.Runtime.InteropServices.Architecture.X64 ||
+                                 processArch == System.Runtime.InteropServices.Architecture.Arm64;
+            }
+            else
+            {
+                archCompatible = processArch == effectiveDumpArch;
+            }
+
+            if (!archCompatible)
+            {
+                Console.Error.WriteLine("[!] Architecture mismatch between tool and dump.");
+                Console.Error.WriteLine("[!] This commonly causes BadImageFormatException / CreateDacInstance failed 0x80070057 when loading the DAC.");
+                Console.Error.WriteLine("[!] Use an analysis binary that matches the dump CPU architecture:");
+                Console.Error.WriteLine("    - AMD64 dump -> run the win-x64 build");
+                Console.Error.WriteLine("    - ARM64 dump -> run the win-arm64 build");
+                Console.Error.WriteLine("    - x86 dump   -> run the win-x86 build (if available)");
+                Console.Error.WriteLine("[!] If you are on ARM64 Windows analyzing an AMD64 dump, run the x64 build under x64 emulation.");
+                return;
+            }
 
             Console.WriteLine($"[+] CLR: {clr.Version}, Flavor: {clr.Flavor}");
-            Console.WriteLine($"[+] Architecture: {(dataTarget.DataReader.PointerSize == 8 ? "x64" : "x86")}");
+            Console.WriteLine($"[+] Architecture: {FormatDumpArchitecture(dumpArch, dataTarget.DataReader.PointerSize)}");
+
+            // Preflight: if CLR module strongly indicates ARM64 Desktop CLR but we're the x64 build,
+            // avoid the CreateRuntime failure and print actionable guidance.
+            if (clrModuleArchHint == System.Runtime.InteropServices.Architecture.Arm64 &&
+                RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.X64 &&
+                clr.Flavor == ClrFlavor.Desktop)
+            {
+                Console.Error.WriteLine("[!] This dump contains an ARM64 Desktop CLR (FrameworkArm64). The x64 build cannot load an ARM64 DAC.");
+                Console.Error.WriteLine("[!] Re-run with DotnetDumper_arm64.exe.");
+                return;
+            }
+
+            // Managed analysis: default ClrMD runtime creation.
+            ClrRuntime? runtime = null;
+            try
+            {
+                runtime = clr.CreateRuntime();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[!] Unable to create a managed runtime: {ex.Message}");
+                Console.Error.WriteLine("[!] Skipping analysis because managed runtime initialization failed.");
+                return;
+            }
+
+            using var runtimeDispose = runtime;
+            ClrHeap heap = runtime.Heap;
 
             if (!heap.CanWalkHeap)
             {
@@ -222,15 +568,24 @@ namespace DotnetDumper
             Directory.CreateDirectory(assembliesFolder);
 
             // ---- MODULES ----
-            var moduleInfo = EnumerateModules(runtime);
-            string moduleReportPath = Path.Combine(outputFolder, "modules.txt");
-            WriteModuleReport(moduleReportPath, moduleInfo);
-            Console.WriteLine($"[+] Module report written to: {moduleReportPath}");
+            var moduleInfo = EnumerateModules(dataTarget, runtime);
+            if (outputJson)
+            {
+                string moduleJsonPath = Path.Combine(outputFolder, "modules.json");
+                WriteModuleReportJson(moduleJsonPath, moduleInfo);
+                Console.WriteLine($"[+] Module report written to: {moduleJsonPath}");
+            }
+            else
+            {
+                string moduleReportPath = Path.Combine(outputFolder, "modules.txt");
+                WriteModuleReport(moduleReportPath, moduleInfo);
+                Console.WriteLine($"[+] Module report written to: {moduleReportPath}");
+            }
 
             // ---- STRINGS ----
             if (heap.CanWalkHeap)
             {
-                var allStrings = ExtractManagedStrings(heap);
+                var allStrings = ExtractManagedStringsDistinct(heap);
 
                 string allStringsPath = Path.Combine(outputFolder, "managed_strings_all.txt");
                 WriteAllStrings(allStringsPath, allStrings);
@@ -241,22 +596,195 @@ namespace DotnetDumper
                 Console.WriteLine($"[+] Suspicious managed strings written to: {suspiciousStringsPath}");
             }
 
-            string patchReportPath = Path.Combine(outputFolder, "patch_detection.txt");
-            DetectDefensivePatches(dataTarget, runtime, patchReportPath);
-            Console.WriteLine($"[+] Patch detection report written to: {patchReportPath}");
+            if (outputJson)
+            {
+                string patchJsonPath = Path.Combine(outputFolder, "patch_detection.json");
+                DetectDefensivePatches(dataTarget, runtime, null, patchJsonPath);
+                Console.WriteLine($"[+] Patch detection report written to: {patchJsonPath}");
+            }
+            else
+            {
+                string patchReportPath = Path.Combine(outputFolder, "patch_detection.txt");
+                DetectDefensivePatches(dataTarget, runtime, patchReportPath, null);
+                Console.WriteLine($"[+] Patch detection report written to: {patchReportPath}");
+            }
 
             // ---- DUMP MODULES (with dedupe) ----
-            DumpModules(dataTarget, runtime, assembliesFolder, dumpAllNonMicrosoft);
+            DumpModules(dataTarget, runtime, assembliesFolder, dumpAllNonMicrosoft, encodeKey);
+            string encodingSuffix = encodeKey != null ? " (RC4 encoded)" : "";
             Console.WriteLine(dumpAllNonMicrosoft
-                ? "[+] Dynamic + non-Microsoft file-backed assemblies dumped (deduped) to: " + assembliesFolder
-                : "[+] Dynamic assemblies dumped (deduped) to: " + assembliesFolder);
+                ? $"[+] Dynamic + non-Microsoft file-backed assemblies dumped (deduped){encodingSuffix} to: " + assembliesFolder
+                : $"[+] Dynamic assemblies dumped (deduped){encodingSuffix} to: " + assembliesFolder);
+        }
+
+        private static bool IsLikelyClrProcess(int pid, out string? error)
+        {
+            error = null;
+
+            try
+            {
+                using Process process = Process.GetProcessById(pid);
+                return IsLikelyClrProcess(process, out error);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static bool IsLikelyClrProcess(Process process, out string? error)
+        {
+            error = null;
+
+            try
+            {
+                // Heuristic: presence of CLR modules is usually sufficient.
+                // For .NET Framework: clr.dll/mscorwks.dll/mscoree.dll
+                // For .NET (Core/5+): coreclr.dll/hostfxr.dll
+                foreach (ProcessModule module in process.Modules)
+                {
+                    string name = module.ModuleName ?? "";
+                    if (name.Equals("coreclr.dll", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("clr.dll", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("mscorwks.dll", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("mscoree.dll", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("hostfxr.dll", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static bool TryGetClrModuleArchHintFromLiveProcess(
+            int pid,
+            out System.Runtime.InteropServices.Architecture? archHint,
+            out string? clrModulePath,
+            out string? error)
+        {
+            archHint = null;
+            clrModulePath = null;
+            error = null;
+
+            try
+            {
+                using Process process = Process.GetProcessById(pid);
+
+                foreach (ProcessModule module in process.Modules)
+                {
+                    string moduleName = module.ModuleName ?? "";
+                    if (!moduleName.Equals("clr.dll", StringComparison.OrdinalIgnoreCase) &&
+                        !moduleName.Equals("coreclr.dll", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    clrModulePath = module.FileName;
+                    if (string.IsNullOrWhiteSpace(clrModulePath))
+                        return true;
+
+                    if (clrModulePath.Contains(@"\Microsoft.NET\FrameworkArm64\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        archHint = System.Runtime.InteropServices.Architecture.Arm64;
+                        return true;
+                    }
+
+                    if (clrModulePath.Contains(@"\Microsoft.NET\Framework64\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        archHint = System.Runtime.InteropServices.Architecture.X64;
+                        return true;
+                    }
+
+                    if (clrModulePath.Contains(@"\Microsoft.NET\Framework\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        archHint = System.Runtime.InteropServices.Architecture.X86;
+                        return true;
+                    }
+
+                    // Found CLR but couldn't infer arch.
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static bool DumpContainsClr(string dumpPath, out string? error)
+        {
+            error = null;
+
+            try
+            {
+                using DataTarget dataTarget = DataTarget.LoadDump(dumpPath);
+                return dataTarget.ClrVersions.Any();
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        private static string FormatDumpArchitecture(Architecture dumpArch, int pointerSize)
+        {
+            return dumpArch switch
+            {
+                Architecture.X86 => "x86",
+                Architecture.X64 => "x64",
+                Architecture.Arm64 => "arm64",
+                _ => pointerSize == 8 ? "64-bit" : "32-bit"
+            };
         }
 
         // ------------------------------ MODULES ------------------------------
 
-        private static List<ModuleRecord> EnumerateModules(ClrRuntime runtime)
+        private static List<ModuleRecord> EnumerateModules(DataTarget dataTarget, ClrRuntime runtime)
         {
             var records = new List<ModuleRecord>();
+
+            // Some dump formats / CLR flavors cause ClrMD to report module sizes as 0.
+            // The native module list in the dump usually has image sizes, so we use it as a fallback.
+            Dictionary<ulong, long> nativeSizeByBase = new Dictionary<ulong, long>();
+            Dictionary<string, long> nativeSizeByPath = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (ModuleInfo m in dataTarget.EnumerateModules())
+                {
+                    if (m.ImageBase != 0 && m.ImageSize > 0)
+                        nativeSizeByBase[m.ImageBase] = m.ImageSize;
+
+                    if (!string.IsNullOrWhiteSpace(m.FileName) && m.ImageSize > 0)
+                        nativeSizeByPath[m.FileName] = m.ImageSize;
+                }
+            }
+            catch
+            {
+                // best effort only
+            }
 
             foreach (ClrAppDomain domain in runtime.AppDomains)
             {
@@ -276,14 +804,25 @@ namespace DotnetDumper
                                              string.IsNullOrEmpty(moduleName) ||
                                              !hasPath;
 
+                    ulong baseAddress = module.Address;
+                    ulong size = (ulong)Math.Max(0, module.Size);
+
+                    if (size == 0)
+                    {
+                        if (nativeSizeByBase.TryGetValue(baseAddress, out long nativeSize) && nativeSize > 0)
+                            size = (ulong)nativeSize;
+                        else if (!string.IsNullOrWhiteSpace(moduleName) && nativeSizeByPath.TryGetValue(moduleName, out long nativePathSize) && nativePathSize > 0)
+                            size = (ulong)nativePathSize;
+                    }
+
                     records.Add(new ModuleRecord
                     {
                         AppDomainId = domain.Id,
                         AppDomainName = domain.Name ?? "",
                         ModuleName = moduleName,
                         AssemblyName = assemblyName,
-                        BaseAddress = module.Address,
-                        Size = (ulong)module.Size,
+                        BaseAddress = baseAddress,
+                        Size = size,
                         IsDynamic = module.IsDynamic,
                         IsMicrosoft = isMicrosoft,
                         IsDynamicOrNoFile = isDynamicOrNoFile
@@ -318,11 +857,42 @@ namespace DotnetDumper
             }
         }
 
+        private static void WriteModuleReportJson(string path, List<ModuleRecord> modules)
+        {
+            using var stream = new FileStream(path, FileMode.Create, FileAccess.Write);
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+            
+            writer.WriteStartObject();
+            writer.WriteString("generatedAt", DateTime.UtcNow.ToString("o"));
+            writer.WriteNumber("totalModules", modules.Count);
+            
+            writer.WriteStartArray("modules");
+            foreach (var m in modules)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("appDomainId", m.AppDomainId);
+                writer.WriteString("appDomainName", m.AppDomainName);
+                writer.WriteString("assemblyName", m.AssemblyName);
+                writer.WriteString("moduleName", m.ModuleName);
+                writer.WriteString("baseAddress", $"0x{m.BaseAddress:x16}");
+                writer.WriteNumber("size", m.Size);
+                writer.WriteBoolean("isDynamic", m.IsDynamic);
+                writer.WriteBoolean("isMicrosoft", m.IsMicrosoft);
+                writer.WriteBoolean("isDynamicOrNoFile", m.IsDynamicOrNoFile);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            
+            writer.WriteEndObject();
+        }
+
         // ------------------------------ STRINGS ------------------------------
 
-        private static List<string> ExtractManagedStrings(ClrHeap heap)
+        private static HashSet<string> ExtractManagedStringsDistinct(ClrHeap heap)
         {
-            var result = new List<string>(capacity: 50_000);
+            // We ultimately write sorted distinct strings, so de-dupe during heap walk
+            // to reduce memory pressure and redundant work.
+            var result = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var obj in heap.EnumerateObjects())
             {
@@ -353,15 +923,13 @@ namespace DotnetDumper
             return result;
         }
 
-        private static void WriteAllStrings(string path, List<string> strings)
+        private static void WriteAllStrings(string path, IEnumerable<string> strings)
         {
-            var distinct = strings
-                .Distinct(StringComparer.Ordinal)
-                .OrderBy(s => s, StringComparer.Ordinal);
+            var ordered = strings.OrderBy(s => s, StringComparer.Ordinal);
 
             using var writer = new StreamWriter(path, false, Utf8NoBomSafe);
 
-            foreach (var s in distinct)
+            foreach (var s in ordered)
                 writer.WriteLine(s);
         }
 
@@ -405,7 +973,7 @@ namespace DotnetDumper
             return isPrivate || !isSpecialNonPublic;
         }
 
-        private static void WriteSuspiciousStrings(string path, List<string> strings)
+        private static void WriteSuspiciousStrings(string path, IEnumerable<string> strings)
         {
             var hits = new HashSet<string>(StringComparer.Ordinal);
             var ips = new HashSet<string>(StringComparer.Ordinal);
@@ -413,8 +981,6 @@ namespace DotnetDumper
 
             foreach (string s in strings)
             {
-                string lower = s.ToLowerInvariant();
-
                 // Extract IPs regardless of regex match
                 foreach (var ip in ExtractIpAddresses(s))
                     ips.Add(ip);
@@ -423,6 +989,8 @@ namespace DotnetDumper
                 bool isSuspicious = SuspiciousRegexes.Any(re => re.IsMatch(s));
                 if (!isSuspicious)
                     continue;
+
+                string lower = s.ToLowerInvariant();
 
                 // Skip if it matches a benign domain pattern
                 if (ContainsBenignDomain(lower))
@@ -465,7 +1033,7 @@ namespace DotnetDumper
 
         // -------------------------- PATCH DETECTION ----------------------------
 
-        private static void DetectDefensivePatches(DataTarget dataTarget, ClrRuntime runtime, string outputPath)
+        private static void DetectDefensivePatches(DataTarget dataTarget, ClrRuntime runtime, string? outputPath, string? jsonOutputPath)
         {
             var findings = new List<PatchFinding>();
 
@@ -509,7 +1077,7 @@ namespace DotnetDumper
             var amsiTargets = new[] { "AmsiScanBuffer", "AmsiScanString" };
             var etwTargets = new[] { "EtwEventWrite", "EtwEventWriteEx", "NtTraceEvent" };
 
-            // Search for amsi.dll and ntdll.dll modules
+            // Search for amsi.dll, ntdll.dll, and clr.dll modules
             foreach (var module in dataTarget.DataReader.EnumerateModules())
             {
                 string moduleName = Path.GetFileName(module.FileName ?? "").ToLowerInvariant();
@@ -522,10 +1090,43 @@ namespace DotnetDumper
                 {
                     ScanModuleExportsForPatches(dataTarget, module, suspiciousPatterns, "ETW", etwTargets, findings);
                 }
+                else if (moduleName == "clr.dll")
+                {
+                    // Detect stealthier CLR.dll-based patches (Provider Handle, Subscriber Bit, AMSI globals)
+                    // Reference: https://loland.cv/posts/2025-11-27-stealthier-reflective-loading/
+                    ScanClrForStealthPatches(dataTarget, module, findings);
+                }
             }
 
             // Write findings to report
-            WritePatchReport(outputPath, findings);
+            if (outputPath != null)
+            {
+                WritePatchReport(outputPath, findings);
+            }
+            
+            if (jsonOutputPath != null)
+            {
+                WritePatchReportJson(jsonOutputPath, findings);
+            }
+            
+            // Console output for findings (regardless of output format)
+            if (findings.Count == 0)
+            {
+                Console.WriteLine("[+] No AMSI/ETW patches detected");
+            }
+            else
+            {
+                foreach (var group in findings.GroupBy(f => f.Category))
+                {
+                    string warningMsg = group.Key switch
+                    {
+                        "CLR_ETW_Stealth" => $"[!] WARNING: {group.Count()} CLR.dll stealth ETW patch(es) detected!",
+                        "CLR_AMSI_Stealth" => $"[!] WARNING: {group.Count()} CLR.dll stealth AMSI patch(es) detected!",
+                        _ => $"[!] WARNING: {group.Count()} {group.Key} patch(es) detected!"
+                    };
+                    Console.WriteLine(warningMsg);
+                }
+            }
         }
 
         private static void ScanModuleExportsForPatches(DataTarget dataTarget, ModuleInfo module,
@@ -623,6 +1224,249 @@ namespace DotnetDumper
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[!] Error scanning {module.FileName}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Detects stealthier CLR.dll-based ETW/AMSI bypasses that don't require memory protection changes.
+        /// These patches target writable .data section globals in clr.dll:
+        /// 1. Provider Handle Patching - Microsoft_Windows_DotNETRuntimeHandle set to 1 (crash-avoidance value)
+        /// 2. CLR AMSI Patching - amsiScanBuffer/g_amsiContext tampered
+        /// Reference: https://loland.cv/posts/2025-11-27-stealthier-reflective-loading/
+        /// 
+        /// NOTE: We do NOT check EnableBits=0 because that's the normal state when no ETW consumer is subscribed.
+        /// </summary>
+        private static void ScanClrForStealthPatches(DataTarget dataTarget, ModuleInfo module, List<PatchFinding> findings)
+        {
+            try
+            {
+                ulong moduleBase = module.ImageBase;
+                ulong moduleSize = (ulong)module.IndexFileSize;
+
+                if (moduleSize == 0 || moduleSize > 50 * 1024 * 1024)
+                    return;
+
+                byte[] moduleBytes = new byte[moduleSize];
+                int read = dataTarget.DataReader.Read(moduleBase, moduleBytes);
+
+                if (read <= 0)
+                    return;
+
+                // 1. Detect Provider Handle Patching
+                // Pattern: mov rcx, qword ptr [Microsoft_Windows_DotNETRuntimeHandle] ; call CoTemplate_*
+                // Signature: 48 8b 0d ?? ?? ?? ?? e8 (mov rcx, [rip+offset]; call rel32)
+                // 
+                // A handle value of 1 is the attacker's crash-avoidance value (0 would crash in some ETW paths)
+                // A valid handle is typically a large pointer value like 0x7e0cc620
+                var handleAddresses = new Dictionary<ulong, int>();
+                for (int i = 0; i < read - 12; i++)
+                {
+                    // Look for: 48 8b 0d XX XX XX XX e8 (mov rcx, [rip+??]; call ??)
+                    if (moduleBytes[i] == 0x48 && moduleBytes[i + 1] == 0x8b && moduleBytes[i + 2] == 0x0d &&
+                        moduleBytes[i + 7] == 0xe8)
+                    {
+                        // Calculate the global variable address from RIP-relative offset
+                        int offset = BitConverter.ToInt32(moduleBytes, i + 3);
+                        ulong rip = moduleBase + (ulong)(i + 7); // RIP after the mov instruction
+                        ulong handleAddr = (ulong)((long)rip + offset);
+
+                        // Verify it points within the module's .data section (rough check)
+                        if (handleAddr > moduleBase && handleAddr < moduleBase + (ulong)read)
+                        {
+                            if (!handleAddresses.ContainsKey(handleAddr))
+                                handleAddresses[handleAddr] = 0;
+                            handleAddresses[handleAddr]++;
+                        }
+                    }
+                }
+
+                // The most frequently referenced handle is likely Microsoft_Windows_DotNETRuntimeHandle
+                if (handleAddresses.Count > 0)
+                {
+                    var mostCommonHandle = handleAddresses.OrderByDescending(kv => kv.Value).First();
+                    ulong handleAddr = mostCommonHandle.Key;
+                    int handleOffset = (int)(handleAddr - moduleBase);
+
+                    if (handleOffset >= 0 && handleOffset + 8 <= read)
+                    {
+                        long handleValue = BitConverter.ToInt64(moduleBytes, handleOffset);
+
+                        // Only flag handle value of 1 - this is the specific crash-avoidance value attackers use
+                        // Value 0 could be normal (provider not yet registered or no .NET activity yet)
+                        // Valid handles are large pointer values (e.g., 0x7e0cc620)
+                        if (handleValue == 1)
+                        {
+                            findings.Add(new PatchFinding
+                            {
+                                Category = "CLR_ETW_Stealth",
+                                ModuleName = module.FileName ?? "clr.dll",
+                                ModuleBase = moduleBase,
+                                FunctionName = "Microsoft_Windows_DotNETRuntimeHandle",
+                                PatchType = "ProviderHandle_CrashAvoidance",
+                                Offset = handleOffset,
+                                Address = handleAddr,
+                                Pattern = $"Value: 0x{handleValue:X16} (attack value to avoid NULL crashes)"
+                            });
+                        }
+                    }
+                }
+
+                // NOTE: We intentionally do NOT check EnableBits = 0 
+                // EnableBits = 0 is the NORMAL state when no ETW consumer (logman, EDR, etc.) is subscribed
+                // Attackers patch it to 0, but it's also 0 most of the time naturally = too many false positives
+
+                // 2. Detect CLR AMSI Patching (amsiScanBuffer/g_amsiContext globals)
+                // Attack flow from clr!AmsiScan:
+                //   if (!g_amsiContext && !is_amsi_initialized) { // initialize AMSI }
+                //   amsiScanBuffer(g_amsiContext, malicious_assembly);
+                //
+                // To bypass: set g_amsiContext=1 (skip init), set amsiScanBuffer=fakeFunc (return 1 = scan failed)
+                //
+                // Signature to find these globals:
+                //   lea rdx, "AmsiScanBuffer"    ; 48 8d 15 ?? ?? ?? ??
+                //   call GetProcAddress          ; ff 15 ?? ?? ?? ??
+                //   mov [amsiScanBuffer], rax    ; 48 89 ?? ?? ?? ?? ??
+                //   mov r??, [g_amsiContext]     ; 48 8b ?? ?? ?? ?? ??
+                
+                // Get amsi.dll address range to check if amsiScanBuffer points inside it
+                ulong amsiDllBase = 0, amsiDllEnd = 0;
+                foreach (var mod in dataTarget.DataReader.EnumerateModules())
+                {
+                    if (Path.GetFileName(mod.FileName ?? "").Equals("amsi.dll", StringComparison.OrdinalIgnoreCase))
+                    {
+                        amsiDllBase = mod.ImageBase;
+                        amsiDllEnd = mod.ImageBase + (ulong)mod.IndexFileSize;
+                        break;
+                    }
+                }
+
+                for (int i = 0; i < read - 30; i++)
+                {
+                    // Look for: 48 8d 15 (lea rdx, [rip+??])
+                    if (moduleBytes[i] == 0x48 && moduleBytes[i + 1] == 0x8d && moduleBytes[i + 2] == 0x15)
+                    {
+                        int leaOffset = BitConverter.ToInt32(moduleBytes, i + 3);
+                        ulong leaRip = moduleBase + (ulong)(i + 7);
+                        ulong stringAddr = (ulong)((long)leaRip + leaOffset);
+
+                        // Check if this points to "AmsiScanBuffer" string
+                        int stringOffset = (int)(stringAddr - moduleBase);
+                        if (stringOffset >= 0 && stringOffset + 14 <= read)
+                        {
+                            string potentialString = Encoding.ASCII.GetString(moduleBytes, stringOffset, 14);
+                            if (potentialString == "AmsiScanBuffer")
+                            {
+                                // Found the AMSI code! Now find the global variables
+                                // Search forward for: ff 15 (call GetProcAddress)
+                                for (int j = i + 7; j < Math.Min(i + 50, read - 14); j++)
+                                {
+                                    if (moduleBytes[j] == 0xff && moduleBytes[j + 1] == 0x15)
+                                    {
+                                        // After GetProcAddress call, look for mov [amsiScanBuffer], rax
+                                        for (int k = j + 6; k < Math.Min(j + 20, read - 11); k++)
+                                        {
+                                            // 48 89 05/0d/15/1d/25/2d/35/3d = mov [rip+??], rax/rcx/rdx/rbx/rsp/rbp/rsi/rdi
+                                            if (moduleBytes[k] == 0x48 && moduleBytes[k + 1] == 0x89 && 
+                                                (moduleBytes[k + 2] & 0xC7) == 0x05) // ModRM for [rip+disp32]
+                                            {
+                                                int movOffset = BitConverter.ToInt32(moduleBytes, k + 3);
+                                                ulong movRip = moduleBase + (ulong)(k + 7);
+                                                ulong amsiScanBufferAddr = (ulong)((long)movRip + movOffset);
+
+                                                int amsiScanBufferOffset = (int)(amsiScanBufferAddr - moduleBase);
+                                                if (amsiScanBufferOffset >= 0 && amsiScanBufferOffset + 8 <= read)
+                                                {
+                                                    ulong amsiScanBufferValue = BitConverter.ToUInt64(moduleBytes, amsiScanBufferOffset);
+
+                                                    // Suspicious if:
+                                                    // 1. Small value like 1 (pre-set to skip initialization)
+                                                    // 2. Non-zero but NOT pointing inside amsi.dll (fake function)
+                                                    bool isSmallValue = (amsiScanBufferValue >= 1 && amsiScanBufferValue <= 0xFFFF);
+                                                    bool isOutsideAmsi = (amsiScanBufferValue != 0 && 
+                                                                          amsiDllBase != 0 && 
+                                                                          (amsiScanBufferValue < amsiDllBase || amsiScanBufferValue >= amsiDllEnd));
+
+                                                    if (isSmallValue)
+                                                    {
+                                                        findings.Add(new PatchFinding
+                                                        {
+                                                            Category = "CLR_AMSI_Stealth",
+                                                            ModuleName = module.FileName ?? "clr.dll",
+                                                            ModuleBase = moduleBase,
+                                                            FunctionName = "amsiScanBuffer",
+                                                            PatchType = "AmsiScanBuffer_SmallValue",
+                                                            Offset = amsiScanBufferOffset,
+                                                            Address = amsiScanBufferAddr,
+                                                            Pattern = $"Value: 0x{amsiScanBufferValue:X16} (pre-set to skip GetProcAddress)"
+                                                        });
+                                                    }
+                                                    else if (isOutsideAmsi)
+                                                    {
+                                                        findings.Add(new PatchFinding
+                                                        {
+                                                            Category = "CLR_AMSI_Stealth",
+                                                            ModuleName = module.FileName ?? "clr.dll",
+                                                            ModuleBase = moduleBase,
+                                                            FunctionName = "amsiScanBuffer",
+                                                            PatchType = "AmsiScanBuffer_FakeFunction",
+                                                            Offset = amsiScanBufferOffset,
+                                                            Address = amsiScanBufferAddr,
+                                                            Pattern = $"Value: 0x{amsiScanBufferValue:X16} (points outside amsi.dll!)"
+                                                        });
+                                                    }
+                                                }
+
+                                                // Look for g_amsiContext reference (usually within next ~20 bytes)
+                                                for (int m = k + 7; m < Math.Min(k + 30, read - 11); m++)
+                                                {
+                                                    // 48 8b ?? = mov r64, [rip+??]
+                                                    if (moduleBytes[m] == 0x48 && moduleBytes[m + 1] == 0x8b &&
+                                                        (moduleBytes[m + 2] & 0xC7) == 0x05) // ModRM for [rip+disp32]
+                                                    {
+                                                        int ctxOffset = BitConverter.ToInt32(moduleBytes, m + 3);
+                                                        ulong ctxRip = moduleBase + (ulong)(m + 7);
+                                                        ulong amsiContextAddr = (ulong)((long)ctxRip + ctxOffset);
+
+                                                        int amsiContextOffset = (int)(amsiContextAddr - moduleBase);
+                                                        if (amsiContextOffset >= 0 && amsiContextOffset + 8 <= read &&
+                                                            amsiContextOffset != amsiScanBufferOffset)
+                                                        {
+                                                            ulong amsiContextValue = BitConverter.ToUInt64(moduleBytes, amsiContextOffset);
+
+                                                            // g_amsiContext set to small non-zero value (like 1) to skip initialization
+                                                            // Normal values: 0 (not init) or valid AMSI handle pointer
+                                                            if (amsiContextValue >= 1 && amsiContextValue <= 0xFFFF)
+                                                            {
+                                                                findings.Add(new PatchFinding
+                                                                {
+                                                                    Category = "CLR_AMSI_Stealth",
+                                                                    ModuleName = module.FileName ?? "clr.dll",
+                                                                    ModuleBase = moduleBase,
+                                                                    FunctionName = "g_amsiContext",
+                                                                    PatchType = "AmsiContext_FakeInit",
+                                                                    Offset = amsiContextOffset,
+                                                                    Address = amsiContextAddr,
+                                                                    Pattern = $"Value: 0x{amsiContextValue:X16} (fake value to skip AMSI init)"
+                                                                });
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                                goto FoundAmsiPattern;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                FoundAmsiPattern:;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[!] Error scanning clr.dll for stealth patches: {ex.Message}");
             }
         }
 
@@ -740,13 +1584,15 @@ namespace DotnetDumper
 
             writer.WriteLine("# AMSI/ETW Patch Detection Report");
             writer.WriteLine($"# Total findings: {findings.Count}");
-            writer.WriteLine("# Detection method: Export-based function scanning (reduces false positives)");
+            writer.WriteLine("# Detection methods:");
+            writer.WriteLine("#   - Export-based function scanning (amsi.dll, ntdll.dll)");
+            writer.WriteLine("#   - CLR.dll stealth patch detection (Provider Handle, Subscriber Bit, AMSI globals)");
+            writer.WriteLine("#   Reference: https://loland.cv/posts/2025-11-27-stealthier-reflective-loading/");
             writer.WriteLine();
 
             if (findings.Count == 0)
             {
                 writer.WriteLine("No AMSI or ETW patches detected.");
-                Console.WriteLine("[+] No AMSI/ETW patches detected");
                 return;
             }
 
@@ -755,7 +1601,14 @@ namespace DotnetDumper
 
             foreach (var group in groupedFindings)
             {
-                writer.WriteLine($"## {group.Key} Patches Detected");
+                string categoryDescription = group.Key switch
+                {
+                    "CLR_ETW_Stealth" => "CLR.dll ETW Stealth Patches (No VirtualProtect Required)",
+                    "CLR_AMSI_Stealth" => "CLR.dll AMSI Stealth Patches (No VirtualProtect Required)",
+                    _ => $"{group.Key} Patches Detected"
+                };
+
+                writer.WriteLine($"## {categoryDescription}");
                 writer.WriteLine();
                 writer.WriteLine("Module\tFunction\tPatch Type\tAddress\tOffset\tPattern");
 
@@ -767,13 +1620,48 @@ namespace DotnetDumper
                 }
 
                 writer.WriteLine();
-                Console.WriteLine($"[!] WARNING: {group.Count()} {group.Key} patch(es) detected!");
             }
+        }
+
+        private static void WritePatchReportJson(string path, List<PatchFinding> findings)
+        {
+            using var stream = new FileStream(path, FileMode.Create, FileAccess.Write);
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+            
+            writer.WriteStartObject();
+            writer.WriteString("generatedAt", DateTime.UtcNow.ToString("o"));
+            writer.WriteNumber("totalFindings", findings.Count);
+            
+            writer.WriteStartArray("detectionMethods");
+            writer.WriteStringValue("Export-based function scanning (amsi.dll, ntdll.dll)");
+            writer.WriteStringValue("CLR.dll stealth patch detection (Provider Handle, AMSI globals)");
+            writer.WriteEndArray();
+            
+            writer.WriteString("reference", "https://loland.cv/posts/2025-11-27-stealthier-reflective-loading/");
+            
+            writer.WriteStartArray("findings");
+            foreach (var f in findings)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("category", f.Category);
+                writer.WriteString("module", Path.GetFileName(f.ModuleName));
+                writer.WriteString("modulePath", f.ModuleName);
+                writer.WriteString("moduleBase", $"0x{f.ModuleBase:X16}");
+                writer.WriteString("functionName", f.FunctionName);
+                writer.WriteString("patchType", f.PatchType);
+                writer.WriteString("address", $"0x{f.Address:X16}");
+                writer.WriteString("offset", $"0x{f.Offset:X8}");
+                writer.WriteString("pattern", f.Pattern);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            
+            writer.WriteEndObject();
         }
 
         // -------------------------- DUMP MODULES ----------------------------
 
-        private static void DumpModules(DataTarget dataTarget, ClrRuntime runtime, string assembliesFolder, bool dumpAllNonMicrosoft)
+        private static void DumpModules(DataTarget dataTarget, ClrRuntime runtime, string assembliesFolder, bool dumpAllNonMicrosoft, string? encodeKey)
         {
             foreach (ClrAppDomain domain in runtime.AppDomains)
             {
@@ -810,7 +1698,7 @@ namespace DotnetDumper
 
                     try
                     {
-                        DumpModule(dataTarget, module, assembliesFolder);
+                        DumpModule(dataTarget, module, assembliesFolder, encodeKey);
                     }
                     catch (Exception ex)
                     {
@@ -820,7 +1708,7 @@ namespace DotnetDumper
             }
         }
 
-        private static void DumpModule(DataTarget dataTarget, ClrModule module, string assembliesFolder)
+        private static void DumpModule(DataTarget dataTarget, ClrModule module, string assembliesFolder, string? encodeKey)
         {
             ulong sizeU = module.Size;
             if (sizeU == 0 || sizeU > int.MaxValue)
@@ -906,7 +1794,7 @@ namespace DotnetDumper
             hashList.Add(hashHex);
 
             // Determine .exe vs .dll from PE header (ignoring fake 'extensions' from display names)
-            string extension = DeterminePeExtension(buffer, filePathFromModule);
+            string extension = encodeKey != null ? ".bin" : DeterminePeExtension(buffer, filePathFromModule);
 
             string safeBaseName = SanitizeFileName(baseName);
 
@@ -920,10 +1808,13 @@ namespace DotnetDumper
                 fileName = $"{safeBaseName}_{module.ImageBase:x16}{extension}";
             }
 
-            string fullPath = Path.Combine(assembliesFolder, fileName);
-            File.WriteAllBytes(fullPath, buffer);
+            byte[] dataToWrite = encodeKey != null ? Rc4(buffer, Encoding.UTF8.GetBytes(encodeKey)) : buffer;
 
-            Console.WriteLine($"[+] Dumped assembly: {fileName}");
+            string fullPath = Path.Combine(assembliesFolder, fileName);
+            File.WriteAllBytes(fullPath, dataToWrite);
+
+            string encodeNote = encodeKey != null ? " [RC4 encoded]" : "";
+            Console.WriteLine($"[+] Dumped assembly: {fileName}{encodeNote}");
         }
 
         private static string DeterminePeExtension(byte[] buffer, string filePathFromModule)
@@ -1024,5 +1915,39 @@ namespace DotnetDumper
         }
 
         private static string YN(bool b) => b ? "Y" : "N";
+
+        // ------------------------------ RC4 ------------------------------
+
+        /// <summary>
+        /// Simple RC4 stream cipher. Same function encodes and decodes.
+        /// </summary>
+        private static byte[] Rc4(byte[] data, byte[] key)
+        {
+            // Key-scheduling algorithm (KSA)
+            byte[] S = new byte[256];
+            for (int i = 0; i < 256; i++)
+                S[i] = (byte)i;
+
+            int j = 0;
+            for (int i = 0; i < 256; i++)
+            {
+                j = (j + S[i] + key[i % key.Length]) & 0xFF;
+                (S[i], S[j]) = (S[j], S[i]);
+            }
+
+            // Pseudo-random generation algorithm (PRGA)
+            byte[] result = new byte[data.Length];
+            int x = 0, y = 0;
+            for (int k = 0; k < data.Length; k++)
+            {
+                x = (x + 1) & 0xFF;
+                y = (y + S[x]) & 0xFF;
+                (S[x], S[y]) = (S[y], S[x]);
+                byte keystreamByte = S[(S[x] + S[y]) & 0xFF];
+                result[k] = (byte)(data[k] ^ keystreamByte);
+            }
+
+            return result;
+        }
     }
 }
