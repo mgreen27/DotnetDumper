@@ -135,6 +135,7 @@ namespace DotnetDumper
             string dumpPath = string.Empty;
             string? outputFolder = null;
             int? targetPid = null;
+            bool fullMemoryDump = false;
 
             // Args:
             //  DotnetDumper <dumpPath> [outputFolder] [--dump-all] [--json] [--encode [key]]
@@ -144,6 +145,10 @@ namespace DotnetDumper
             int startIndex;
             if (pidMode)
             {
+                // In --pid mode we default to a full-memory minidump to ensure PE bytes are present
+                // (required for reliable reflective assembly recovery across architectures).
+                fullMemoryDump = true;
+
                 if (args.Length < 2)
                 {
                     PrintUsage();
@@ -271,10 +276,23 @@ namespace DotnetDumper
 
                 Console.WriteLine($"[+] Dump path: {dumpPath}");
 
-                if (!TryWriteProcessDump(targetPid.Value, dumpPath, out string? dumpError))
+                if (fullMemoryDump)
+                    Console.WriteLine("[i] Using full-memory dump mode (larger output, better assembly recovery).");
+
+                if (!TryWriteProcessDump(targetPid.Value, dumpPath, fullMemoryDump, out string? dumpError))
                 {
                     Console.Error.WriteLine($"[!] Failed to write process dump: {dumpError}");
                     return 2;
+                }
+
+                try
+                {
+                    long bytes = new FileInfo(dumpPath).Length;
+                    Console.WriteLine($"[+] Dump size: {bytes:N0} bytes");
+                }
+                catch
+                {
+                    // best effort
                 }
 
                 if (!isClr && clrDetectError != null)
@@ -351,7 +369,7 @@ namespace DotnetDumper
             Console.WriteLine("  --encode [key]  RC4 encode dumped assemblies (evades AV), saves as .bin");
             Console.WriteLine("                  Default key: 'infected'");
             Console.WriteLine("  --pid <pid>     Capture a Windows process dump first, then triage it");
-            Console.WriteLine("                  NOTE: dump capture uses a 'process-style' minidump (not full-memory).");
+            Console.WriteLine("                  NOTE: default capture includes full process memory.");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  DotnetDumper C:\\dumps\\w3wp.dmp");
@@ -367,11 +385,16 @@ namespace DotnetDumper
         //   MiniDumpWithHandleData          = 0x00000004
         //   MiniDumpScanMemory              = 0x00000010
         //   MiniDumpWithUnloadedModules     = 0x00000020
+        //   MiniDumpWithIndirectlyReferencedMemory = 0x00000040
         //   MiniDumpWithPrivateReadWriteMem = 0x00000200
         //   MiniDumpWithFullMemoryInfo      = 0x00000800
         //   MiniDumpWithThreadInfo          = 0x00001000
+        //   MiniDumpWithCodeSegs            = 0x00002000
+        //   MiniDumpWithPrivateWriteCopyMemory = 0x00010000
+        //   MiniDumpIgnoreInaccessibleMemory   = 0x00020000
         //   MiniDumpWithTokenInformation    = 0x00004000
-        // Combined: 0x00005A35
+        //   MiniDumpWithModuleHeaders       = 0x00080000
+        // Combined: 0x000B7A75
 
         [DllImport("dbghelp.dll", SetLastError = true)]
         private static extern bool MiniDumpWriteDump(
@@ -383,7 +406,13 @@ namespace DotnetDumper
             IntPtr userStreamParam,
             IntPtr callbackParam);
 
-        private static bool TryWriteProcessDump(int pid, string dumpPath, out string? error)
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static bool TryWriteProcessDump(int pid, string dumpPath, bool fullMemory, out string? error)
         {
             if (!OperatingSystem.IsWindows())
             {
@@ -393,26 +422,49 @@ namespace DotnetDumper
 
             try
             {
-                using Process process = Process.GetProcessById(pid);
+                // Match Velociraptor's proc_dump approach:
+                // OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_DUP_HANDLE)
+                const uint PROCESS_QUERY_INFORMATION = 0x0400;
+                const uint PROCESS_VM_READ = 0x0010;
+                const uint PROCESS_DUP_HANDLE = 0x0040;
 
-                // Process-style dump (not full-memory). This is a compromise between fidelity and size.
-                const uint flags = 0x00005A35;
-
-                using var fs = new FileStream(dumpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-                bool ok = MiniDumpWriteDump(
-                    process.Handle,
-                    process.Id,
-                    fs.SafeFileHandle,
-                    flags,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
-
-                if (!ok)
+                IntPtr processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, false, pid);
+                if (processHandle == IntPtr.Zero)
                 {
                     int lastError = Marshal.GetLastWin32Error();
-                    error = $"MiniDumpWriteDump failed. Win32Error={lastError}";
+                    error = $"OpenProcess failed. Win32Error={lastError}";
                     return false;
+                }
+
+                try
+                {
+                    // Base flags for richer triage; full memory ensures bytes are present.
+                    uint flags = 0x000B7A75;
+
+                    // MiniDumpWithFullMemory = 0x00000002
+                    if (fullMemory)
+                        flags |= 0x00000002;
+
+                    using var fs = new FileStream(dumpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                    bool ok = MiniDumpWriteDump(
+                        processHandle,
+                        pid,
+                        fs.SafeFileHandle,
+                        flags,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero);
+
+                    if (!ok)
+                    {
+                        int lastError = Marshal.GetLastWin32Error();
+                        error = $"MiniDumpWriteDump failed. Win32Error={lastError}";
+                        return false;
+                    }
+                }
+                finally
+                {
+                    CloseHandle(processHandle);
                 }
 
                 error = null;
@@ -604,7 +656,15 @@ namespace DotnetDumper
             }
 
             // ---- DUMP MODULES (with dedupe) ----
-            DumpModules(dataTarget, runtime, assembliesFolder, dumpAllNonMicrosoft, encodeKey);
+            int dumpedCount = DumpModules(dataTarget, runtime, assembliesFolder, dumpAllNonMicrosoft, encodeKey);
+            if (heap.CanWalkHeap)
+            {
+                // Fallback: reflective/byte[] loads may not have a stable PE image base/size in ClrMD.
+                // Try carving managed PE files from System.Byte[] objects. This is deduped and capped.
+                int carved = CarveManagedPeFromHeap(heap, assembliesFolder, encodeKey, dumpedCount == 0 ? 64 : 16);
+                if (carved > 0)
+                    dumpedCount += carved;
+            }
             string encodingSuffix = encodeKey != null ? " (RC4 encoded)" : "";
             Console.WriteLine(dumpAllNonMicrosoft
                 ? $"[+] Dynamic + non-Microsoft file-backed assemblies dumped (deduped){encodingSuffix} to: " + assembliesFolder
@@ -765,6 +825,27 @@ namespace DotnetDumper
 
         // ------------------------------ MODULES ------------------------------
 
+        private static bool HasFilesystemPath(string? name)
+        {
+            return !string.IsNullOrEmpty(name) && (name.Contains("\\") || name.Contains("/"));
+        }
+
+        private static bool IsMicrosoftAssemblyName(string? assemblyName)
+        {
+            if (string.IsNullOrEmpty(assemblyName))
+                return false;
+
+            return assemblyName.StartsWith("System.", StringComparison.OrdinalIgnoreCase) ||
+                   assemblyName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
+                   assemblyName.Equals("mscorlib", StringComparison.OrdinalIgnoreCase) ||
+                   assemblyName.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsDynamicOrNoFile(ClrModule module, string moduleName)
+        {
+            return module.IsDynamic || string.IsNullOrEmpty(moduleName) || !HasFilesystemPath(moduleName);
+        }
+
         private static List<ModuleRecord> EnumerateModules(DataTarget dataTarget, ClrRuntime runtime)
         {
             var records = new List<ModuleRecord>();
@@ -796,18 +877,11 @@ namespace DotnetDumper
                     string moduleName = module.Name ?? "";
                     string assemblyName = module.AssemblyName ?? "";
 
-                    bool hasPath = moduleName.Contains("\\") || moduleName.Contains("/");
-                    bool isMicrosoft =
-                        assemblyName.StartsWith("System.", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.Equals("mscorlib", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase);
+                    bool isMicrosoft = IsMicrosoftAssemblyName(assemblyName);
+                    bool isDynamicOrNoFile = IsDynamicOrNoFile(module, moduleName);
 
-                    bool isDynamicOrNoFile = module.IsDynamic ||
-                                             string.IsNullOrEmpty(moduleName) ||
-                                             !hasPath;
-
-                    ulong baseAddress = module.Address;
+                    // Prefer the module's in-memory image base when present. ClrModule.Address is the clr!Module object.
+                    ulong baseAddress = module.ImageBase != 0 ? module.ImageBase : module.Address;
                     ulong size = (ulong)Math.Max(0, module.Size);
 
                     if (size == 0)
@@ -1664,8 +1738,27 @@ namespace DotnetDumper
 
         // -------------------------- DUMP MODULES ----------------------------
 
-        private static void DumpModules(DataTarget dataTarget, ClrRuntime runtime, string assembliesFolder, bool dumpAllNonMicrosoft, string? encodeKey)
+        private static int DumpModules(DataTarget dataTarget, ClrRuntime runtime, string assembliesFolder, bool dumpAllNonMicrosoft, string? encodeKey)
         {
+            // Build a native module lookup for base/size fallback (ClrMD sometimes reports 0 size for managed modules).
+            Dictionary<ulong, (ulong ImageBase, long ImageSize, string? FileName)> nativeByBase = new();
+            Dictionary<string, (ulong ImageBase, long ImageSize)> nativeByPath = new(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (ModuleInfo m in dataTarget.EnumerateModules())
+                {
+                    if (m.ImageBase != 0)
+                        nativeByBase[m.ImageBase] = (m.ImageBase, m.ImageSize, m.FileName);
+                    if (!string.IsNullOrWhiteSpace(m.FileName) && m.ImageBase != 0)
+                        nativeByPath[m.FileName] = (m.ImageBase, m.ImageSize);
+                }
+            }
+            catch
+            {
+                // best effort
+            }
+
+            int dumped = 0;
             foreach (ClrAppDomain domain in runtime.AppDomains)
             {
                 foreach (ClrModule module in domain.Modules)
@@ -1673,16 +1766,8 @@ namespace DotnetDumper
                     string moduleName = module.Name ?? "";
                     string assemblyName = module.AssemblyName ?? "";
 
-                    bool hasPath = moduleName.Contains("\\") || moduleName.Contains("/");
-                    bool isMicrosoft =
-                        assemblyName.StartsWith("System.", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.Equals("mscorlib", StringComparison.OrdinalIgnoreCase) ||
-                        assemblyName.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase);
-
-                    bool isDynamicOrNoFile = module.IsDynamic ||
-                                             string.IsNullOrEmpty(moduleName) ||
-                                             !hasPath;
+                    bool isMicrosoft = IsMicrosoftAssemblyName(assemblyName);
+                    bool isDynamicOrNoFile = IsDynamicOrNoFile(module, moduleName);
 
                     bool shouldDump;
                     if (dumpAllNonMicrosoft)
@@ -1701,7 +1786,8 @@ namespace DotnetDumper
 
                     try
                     {
-                        DumpModule(dataTarget, module, assembliesFolder, encodeKey);
+                        if (DumpModule(dataTarget, module, assembliesFolder, encodeKey, nativeByBase, nativeByPath))
+                            dumped++;
                     }
                     catch (Exception ex)
                     {
@@ -1709,20 +1795,55 @@ namespace DotnetDumper
                     }
                 }
             }
+
+            return dumped;
         }
 
-        private static void DumpModule(DataTarget dataTarget, ClrModule module, string assembliesFolder, string? encodeKey)
+        private static bool DumpModule(
+            DataTarget dataTarget,
+            ClrModule module,
+            string assembliesFolder,
+            string? encodeKey,
+            Dictionary<ulong, (ulong ImageBase, long ImageSize, string? FileName)> nativeByBase,
+            Dictionary<string, (ulong ImageBase, long ImageSize)> nativeByPath)
         {
+            ulong imageBase = module.ImageBase;
+            string filePathFromModule = module.Name ?? "";
+
+            // If ClrMD doesn't provide ImageBase for PE-backed modules, try native module list by path.
+            if (imageBase == 0 && !string.IsNullOrWhiteSpace(filePathFromModule) && nativeByPath.TryGetValue(filePathFromModule, out var nativeByPathEntry))
+                imageBase = nativeByPathEntry.ImageBase;
+
+            if (imageBase == 0)
+                return false;
+
             ulong sizeU = module.Size;
+            if (sizeU == 0)
+            {
+                if (nativeByBase.TryGetValue(imageBase, out var native) && native.ImageSize > 0)
+                    sizeU = (ulong)native.ImageSize;
+
+                if (TryGetPeImageSizeFromMemory(dataTarget, imageBase, out int inferredSize, out _))
+                    sizeU = (ulong)inferredSize;
+            }
+
             if (sizeU == 0 || sizeU > int.MaxValue)
-                return;
+            {
+                string asmNameForLog = module.AssemblyName ?? "";
+                string moduleNameForLog = module.Name ?? "";
+                string displayName = !string.IsNullOrWhiteSpace(asmNameForLog)
+                    ? asmNameForLog
+                    : (!string.IsNullOrWhiteSpace(moduleNameForLog) ? moduleNameForLog : "<unknown>");
+                Console.WriteLine($"[i] Skipping module (size unavailable in dump): {displayName} @0x{imageBase:x16}");
+                return false;
+            }
 
             int size = (int)sizeU;
             byte[] buffer = new byte[size];
 
-            int read = dataTarget.DataReader.Read(module.ImageBase, buffer);
+            int read = dataTarget.DataReader.Read(imageBase, buffer);
             if (read <= 0)
-                return;
+                return false;
 
             if (read != buffer.Length)
             {
@@ -1740,7 +1861,6 @@ namespace DotnetDumper
             }
 
             string asmName = module.AssemblyName ?? "";
-            string filePathFromModule = module.Name ?? "";
 
             // Base name selection
             string baseName;
@@ -1790,7 +1910,7 @@ namespace DotnetDumper
             if (hashList.Contains(hashHex, StringComparer.OrdinalIgnoreCase))
             {
                 Console.WriteLine($"[i] Skipping duplicate assembly for {baseName} (same SHA256).");
-                return;
+                return false;
             }
 
             bool isFirstVariant = hashList.Count == 0;
@@ -1808,7 +1928,7 @@ namespace DotnetDumper
             }
             else
             {
-                fileName = $"{safeBaseName}_{module.ImageBase:x16}{extension}";
+                fileName = $"{safeBaseName}_{imageBase:x16}{extension}";
             }
 
             byte[] dataToWrite = encodeKey != null ? Rc4(buffer, Encoding.UTF8.GetBytes(encodeKey)) : buffer;
@@ -1818,6 +1938,260 @@ namespace DotnetDumper
 
             string encodeNote = encodeKey != null ? " [RC4 encoded]" : "";
             Console.WriteLine($"[+] Dumped assembly: {fileName}{encodeNote}");
+
+            return true;
+        }
+
+        private static int CarveManagedPeFromHeap(ClrHeap heap, string assembliesFolder, string? encodeKey, int maxCandidates)
+        {
+            const int minBytes = 4096;
+            const int maxBytes = 100 * 1024 * 1024;
+            const int headerProbe = 0x1000;
+
+            int dumped = 0;
+            int examined = 0;
+
+            foreach (var obj in heap.EnumerateObjects())
+            {
+                if (!obj.IsValid || !obj.IsArray)
+                    continue;
+
+                ClrArray? arr;
+                try
+                {
+                    arr = obj.AsArray();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!arr.HasValue)
+                    continue;
+
+                ClrArray a = arr.Value;
+
+                string? typeName = a.Type?.Name;
+                if (!string.Equals(typeName, "System.Byte[]", StringComparison.Ordinal))
+                    continue;
+
+                int length;
+                try
+                {
+                    length = a.Length;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (length < minBytes || length > maxBytes)
+                    continue;
+
+                examined++;
+                if (examined > 5000)
+                    break; // safety valve
+
+                int probeLen = Math.Min(headerProbe, length);
+                byte[]? probe = null;
+                try
+                {
+                    probe = a.ReadValues<byte>(0, probeLen);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (probe == null || probe.Length == 0)
+                    continue;
+
+                if (!LooksLikeManagedPeFile(probe))
+                    continue;
+
+                // Looks promising: read full byte[] and write to disk.
+                byte[]? bytes = null;
+                try
+                {
+                    bytes = a.ReadValues<byte>(0, length);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (bytes == null || bytes.Length == 0)
+                    continue;
+
+                string hashHex;
+                using (var sha = SHA256.Create())
+                {
+                    var hash = sha.ComputeHash(bytes);
+                    hashHex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                }
+
+                // Use a stable key so we can dedupe repeated heaps.
+                const string key = "heap_carve";
+                if (!AssemblyHashes.TryGetValue(key, out var hashList))
+                {
+                    hashList = new List<string>();
+                    AssemblyHashes[key] = hashList;
+                }
+
+                if (hashList.Contains(hashHex, StringComparer.OrdinalIgnoreCase))
+                    continue;
+
+                hashList.Add(hashHex);
+
+                string extension = encodeKey != null ? ".bin" : DeterminePeExtension(bytes, filePathFromModule: "");
+                string fileName = $"carved_{hashHex.Substring(0, 12)}{extension}";
+
+                byte[] dataToWrite = encodeKey != null ? Rc4(bytes, Encoding.UTF8.GetBytes(encodeKey)) : bytes;
+                string fullPath = Path.Combine(assembliesFolder, fileName);
+                File.WriteAllBytes(fullPath, dataToWrite);
+
+                string encodeNote = encodeKey != null ? " [RC4 encoded]" : "";
+                Console.WriteLine($"[+] Carved assembly from heap: {fileName}{encodeNote}");
+
+                dumped++;
+                if (dumped >= maxCandidates)
+                    break;
+            }
+
+            return dumped;
+        }
+
+        private static bool LooksLikeManagedPeFile(byte[] buffer)
+        {
+            try
+            {
+                if (buffer.Length < 0x200)
+                    return false;
+
+                if (buffer[0] != (byte)'M' || buffer[1] != (byte)'Z')
+                    return false;
+
+                int e_lfanew = BitConverter.ToInt32(buffer, 0x3C);
+                if (e_lfanew <= 0 || e_lfanew + 0x18 >= buffer.Length)
+                    return false;
+
+                if (buffer[e_lfanew] != (byte)'P' || buffer[e_lfanew + 1] != (byte)'E' || buffer[e_lfanew + 2] != 0 || buffer[e_lfanew + 3] != 0)
+                    return false;
+
+                // Optional header starts after signature (4) + file header (20)
+                int optionalHeaderOffset = e_lfanew + 4 + 20;
+                if (optionalHeaderOffset + 2 > buffer.Length)
+                    return false;
+
+                ushort magic = BitConverter.ToUInt16(buffer, optionalHeaderOffset);
+                if (magic != 0x10B && magic != 0x20B)
+                    return false;
+
+                // DataDirectory array is after standard+windows optional header fields.
+                // The COM Descriptor (CLR header) directory is index 14.
+                // For PE32, DataDirectory starts at 0x60 into optional header.
+                // For PE32+, DataDirectory starts at 0x70 into optional header.
+                int dataDirStart = optionalHeaderOffset + (magic == 0x10B ? 0x60 : 0x70);
+                int comDescriptorEntry = dataDirStart + (14 * 8);
+                if (comDescriptorEntry + 8 > buffer.Length)
+                    return false;
+
+                uint clrRva = BitConverter.ToUInt32(buffer, comDescriptorEntry);
+                uint clrSize = BitConverter.ToUInt32(buffer, comDescriptorEntry + 4);
+
+                return clrRva != 0 && clrSize != 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryGetPeImageSizeFromMemory(DataTarget dataTarget, ulong imageBase, out int size, out string? error)
+        {
+            size = 0;
+            error = null;
+
+            try
+            {
+                const int headerReadSize = 0x1000;
+                byte[] header = new byte[headerReadSize];
+                int read = dataTarget.DataReader.Read(imageBase, header);
+                if (read < 0x100)
+                {
+                    error = "unable to read PE header";
+                    return false;
+                }
+
+                // DOS header
+                if (header[0] != (byte)'M' || header[1] != (byte)'Z')
+                {
+                    error = "missing MZ header";
+                    return false;
+                }
+
+                int e_lfanew = BitConverter.ToInt32(header, 0x3C);
+                if (e_lfanew <= 0 || e_lfanew + 4 + 20 >= read)
+                {
+                    error = "invalid e_lfanew";
+                    return false;
+                }
+
+                // NT headers signature
+                if (header[e_lfanew] != (byte)'P' || header[e_lfanew + 1] != (byte)'E' ||
+                    header[e_lfanew + 2] != 0 || header[e_lfanew + 3] != 0)
+                {
+                    error = "missing PE\\0\\0 signature";
+                    return false;
+                }
+
+                // Optional header starts after signature (4) + file header (20)
+                int optionalHeaderOffset = e_lfanew + 4 + 20;
+                if (optionalHeaderOffset + 2 > read)
+                {
+                    error = "optional header truncated";
+                    return false;
+                }
+
+                ushort magic = BitConverter.ToUInt16(header, optionalHeaderOffset);
+                // PE32 (0x10B) or PE32+ (0x20B)
+                if (magic != 0x10B && magic != 0x20B)
+                {
+                    error = $"unexpected optional header magic: 0x{magic:X}";
+                    return false;
+                }
+
+                // SizeOfImage is at offset 0x38 into OPTIONAL_HEADER for both PE32 and PE32+
+                int sizeOfImageOffset = optionalHeaderOffset + 0x38;
+                if (sizeOfImageOffset + 4 > read)
+                {
+                    error = "SizeOfImage field truncated";
+                    return false;
+                }
+
+                uint sizeOfImage = BitConverter.ToUInt32(header, sizeOfImageOffset);
+                if (sizeOfImage == 0)
+                {
+                    error = "SizeOfImage is 0";
+                    return false;
+                }
+
+                // Clamp to avoid pathological allocations.
+                const int maxReasonable = 512 * 1024 * 1024;
+                if (sizeOfImage > maxReasonable)
+                {
+                    error = $"SizeOfImage too large: {sizeOfImage}";
+                    return false;
+                }
+
+                size = (int)sizeOfImage;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
 
         private static string DeterminePeExtension(byte[] buffer, string filePathFromModule)
