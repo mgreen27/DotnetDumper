@@ -210,22 +210,6 @@ namespace DotnetDumper
                     return 0;
                 }
 
-                // Preflight (preferred): ask Windows what machine the *process* is.
-                // This avoids module enumeration overhead and works even when module listing is restricted.
-                if (TryGetProcessMachineInfo(targetPid.Value, out var processMachineArch, out var nativeMachineArch, out var machineErr))
-                {
-                    if (processMachineArch != null && processMachineArch.Value != RuntimeInformation.ProcessArchitecture)
-                    {
-                        Console.Error.WriteLine($"[!] Process machine is {processMachineArch.Value} but you are running {RuntimeInformation.ProcessArchitecture}.");
-                        Console.Error.WriteLine($"[!] Run: {GetRecommendedDumperBinaryName(processMachineArch.Value)}");
-                        return 2;
-                    }
-                }
-                else if (machineErr != null)
-                {
-                    Console.WriteLine($"[i] Preflight process-machine check unavailable: {machineErr}");
-                }
-
                 // Preflight: if we can infer the CLR architecture from module paths, avoid taking a dump
                 // that this build cannot analyze (common for Desktop CLR on ARM64/ARM64EC).
                 if (TryGetClrModuleArchHintFromLiveProcess(targetPid.Value, out var liveClrArchHint, out var liveClrModulePath, out var liveClrHintError))
@@ -382,17 +366,6 @@ namespace DotnetDumper
             IntPtr exceptionParam,
             IntPtr userStreamParam,
             IntPtr callbackParam);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool IsWow64Process2(
-            IntPtr hProcess,
-            out ushort processMachine,
-            out ushort nativeMachine);
-
-        private const ushort IMAGE_FILE_MACHINE_UNKNOWN = 0x0000;
-        private const ushort IMAGE_FILE_MACHINE_I386 = 0x014c;
-        private const ushort IMAGE_FILE_MACHINE_AMD64 = 0x8664;
-        private const ushort IMAGE_FILE_MACHINE_ARM64 = 0xAA64;
 
         private static bool TryWriteProcessDump(int pid, string dumpPath, out string? error)
         {
@@ -677,62 +650,6 @@ namespace DotnetDumper
                 return false;
             }
         }
-
-        private static bool TryGetProcessMachineInfo(
-            int pid,
-            out System.Runtime.InteropServices.Architecture? processArch,
-            out System.Runtime.InteropServices.Architecture? nativeArch,
-            out string? error)
-        {
-            processArch = null;
-            nativeArch = null;
-            error = null;
-
-            if (!OperatingSystem.IsWindows())
-            {
-                error = "IsWow64Process2 is Windows-only.";
-                return false;
-            }
-
-            try
-            {
-                using Process process = Process.GetProcessById(pid);
-
-                if (!IsWow64Process2(process.Handle, out ushort pm, out ushort nm))
-                {
-                    error = $"IsWow64Process2 failed. Win32Error={Marshal.GetLastWin32Error()}";
-                    return false;
-                }
-
-                nativeArch = MapMachineToArch(nm);
-
-                // If pm == UNKNOWN, the process is not under WOW64; treat it as native.
-                processArch = pm == IMAGE_FILE_MACHINE_UNKNOWN
-                    ? nativeArch
-                    : MapMachineToArch(pm);
-
-                return true;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                error = "IsWow64Process2 is not available on this Windows version.";
-                return false;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-        }
-
-        private static System.Runtime.InteropServices.Architecture? MapMachineToArch(ushort machine) =>
-            machine switch
-            {
-                IMAGE_FILE_MACHINE_I386 => System.Runtime.InteropServices.Architecture.X86,
-                IMAGE_FILE_MACHINE_AMD64 => System.Runtime.InteropServices.Architecture.X64,
-                IMAGE_FILE_MACHINE_ARM64 => System.Runtime.InteropServices.Architecture.Arm64,
-                _ => null
-            };
 
         private static string GetRecommendedDumperBinaryName(System.Runtime.InteropServices.Architecture arch) =>
             arch switch
