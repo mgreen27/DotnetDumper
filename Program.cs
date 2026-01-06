@@ -165,22 +165,38 @@ namespace DotnetDumper
                 startIndex = 1;
             }
 
+            string? parseError = null;
+
             for (int i = startIndex; i < args.Length; i++)
             {
-                if (IsDumpAllFlag(args[i]))
+                string arg = args[i];
+
+                if (IsDumpAllFlag(arg))
                     dumpAllNonMicrosoft = true;
-                else if (IsJsonFlag(args[i]))
+                else if (IsJsonFlag(arg))
                     outputJson = true;
-                else if (IsEncodeFlag(args[i]))
+                else if (IsEncodeFlag(arg))
                 {
                     // Default to "infected" if no key provided or next arg is another flag
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-"))
+                    if (i + 1 < args.Length && !LooksLikeFlag(args[i + 1]))
                         encodeKey = args[++i];
                     else
                         encodeKey = "infected";
                 }
-                else if (outputFolder == null)
-                    outputFolder = args[i];
+                else if (outputFolder == null && !LooksLikeFlag(arg))
+                    outputFolder = arg;
+                else if (LooksLikeFlag(arg))
+                {
+                    parseError = $"Unknown option: {arg}";
+                    break;
+                }
+            }
+
+            if (parseError != null)
+            {
+                Console.Error.WriteLine($"[!] {parseError}");
+                PrintUsage();
+                return 1;
             }
 
             if (targetPid != null)
@@ -319,6 +335,10 @@ namespace DotnetDumper
             s.Equals("--pid", StringComparison.OrdinalIgnoreCase) ||
             s.Equals("-pid", StringComparison.OrdinalIgnoreCase);
 
+        private static bool LooksLikeFlag(string s) =>
+            s.StartsWith("-", StringComparison.Ordinal) ||
+            s.StartsWith("/", StringComparison.Ordinal);
+
         private static void PrintUsage()
         {
             Console.WriteLine("Usage:");
@@ -341,28 +361,24 @@ namespace DotnetDumper
             Console.WriteLine("  DotnetDumper --pid 4242 C:\\analysis\\w3wp --dump-all --json");
         }
 
-        [Flags]
-        private enum MINIDUMP_TYPE : uint
-        {
-            MiniDumpNormal = 0x00000000,
-            MiniDumpWithDataSegs = 0x00000001,
-            MiniDumpWithFullMemory = 0x00000002,
-            MiniDumpWithHandleData = 0x00000004,
-            MiniDumpScanMemory = 0x00000010,
-            MiniDumpWithUnloadedModules = 0x00000020,
-            MiniDumpWithIndirectlyReferencedMemory = 0x00000040,
-            MiniDumpWithPrivateReadWriteMemory = 0x00000200,
-            MiniDumpWithFullMemoryInfo = 0x00000800,
-            MiniDumpWithThreadInfo = 0x00001000,
-            MiniDumpWithTokenInformation = 0x00004000,
-        }
+        // MiniDumpWriteDump dumpType flags (MINIDUMP_TYPE) we use:
+        //   MiniDumpNormal                  = 0x00000000
+        //   MiniDumpWithDataSegs            = 0x00000001
+        //   MiniDumpWithHandleData          = 0x00000004
+        //   MiniDumpScanMemory              = 0x00000010
+        //   MiniDumpWithUnloadedModules     = 0x00000020
+        //   MiniDumpWithPrivateReadWriteMem = 0x00000200
+        //   MiniDumpWithFullMemoryInfo      = 0x00000800
+        //   MiniDumpWithThreadInfo          = 0x00001000
+        //   MiniDumpWithTokenInformation    = 0x00004000
+        // Combined: 0x00005A35
 
         [DllImport("dbghelp.dll", SetLastError = true)]
         private static extern bool MiniDumpWriteDump(
             IntPtr hProcess,
             int processId,
             Microsoft.Win32.SafeHandles.SafeFileHandle hFile,
-            MINIDUMP_TYPE dumpType,
+            uint dumpType,
             IntPtr exceptionParam,
             IntPtr userStreamParam,
             IntPtr callbackParam);
@@ -380,16 +396,7 @@ namespace DotnetDumper
                 using Process process = Process.GetProcessById(pid);
 
                 // Process-style dump (not full-memory). This is a compromise between fidelity and size.
-                MINIDUMP_TYPE flags =
-                    MINIDUMP_TYPE.MiniDumpNormal |
-                    MINIDUMP_TYPE.MiniDumpWithUnloadedModules |
-                    MINIDUMP_TYPE.MiniDumpWithHandleData |
-                    MINIDUMP_TYPE.MiniDumpWithThreadInfo |
-                    MINIDUMP_TYPE.MiniDumpWithFullMemoryInfo |
-                    MINIDUMP_TYPE.MiniDumpWithPrivateReadWriteMemory |
-                    MINIDUMP_TYPE.MiniDumpWithDataSegs |
-                    MINIDUMP_TYPE.MiniDumpScanMemory |
-                    MINIDUMP_TYPE.MiniDumpWithTokenInformation;
+                const uint flags = 0x00005A35;
 
                 using var fs = new FileStream(dumpPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
                 bool ok = MiniDumpWriteDump(
